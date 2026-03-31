@@ -16,9 +16,32 @@ const publicDir = path.join(__dirname, 'public');
 const HERMES_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
 const SKINS_DIR = path.join(HERMES_HOME, 'skins');
 const CONFIG_PATH = path.join(HERMES_HOME, 'config.yaml');
-const HERMES_APP_ROOT = process.env.HERMES_AGENT_ROOT || path.join('C:', 'pinokio', 'api', 'hermes-agent.pinokio.git', 'app');
+
+function resolveHermesAppRoot() {
+  const candidates = [
+    process.env.HERMES_AGENT_ROOT,
+    path.join(os.homedir(), '.hermes', 'hermes-agent', 'app'),
+    path.join('C:', 'pinokio', 'api', 'hermes-agent.pinokio.git', 'app')
+  ].filter(Boolean);
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || '';
+}
+
+function resolveHermesPython(appRoot) {
+  if (process.env.HERMES_PYTHON) return process.env.HERMES_PYTHON;
+
+  const candidates = [
+    path.join(appRoot, 'env', 'bin', 'python3'),
+    path.join(appRoot, 'env', 'bin', 'python'),
+    path.join(appRoot, 'env', 'Scripts', 'python.exe')
+  ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[candidates.length - 1];
+}
+
+const HERMES_APP_ROOT = resolveHermesAppRoot();
 const SKIN_ENGINE_PATH = path.join(HERMES_APP_ROOT, 'hermes_cli', 'skin_engine.py');
-const HERMES_PYTHON = process.env.HERMES_PYTHON || path.join(HERMES_APP_ROOT, 'env', 'Scripts', 'python.exe');
+const HERMES_PYTHON = resolveHermesPython(HERMES_APP_ROOT);
 const HERO_ASCII_DEFAULTS = {
   style: 'braille',
   width: 40
@@ -32,6 +55,7 @@ const IMAGE_EXTENSION_MIME_MAP = {
   '.gif': 'image/gif',
   '.webp': 'image/webp'
 };
+const MAX_HERO_IMAGE_BYTES = 6 * 1024 * 1024;
 const BRAILLE_BLANK = '\u2800';
 const BRAILLE_BIT_GRID = [
   [0x01, 0x08],
@@ -271,9 +295,36 @@ const BUILTIN_SKIN_TEMPLATES = {
   }
 };
 
+const BUILTIN_SKIN_CACHE_TTL_MS = Math.max(1000, Number.parseInt(process.env.BUILTIN_SKIN_CACHE_TTL_MS || '30000', 10) || 30000);
+const builtinSkinCache = {
+  loadedAt: 0,
+  templates: BUILTIN_SKIN_TEMPLATES,
+  source: 'fallback'
+};
+
+function normalizeBuiltinSkinTemplates(rawTemplates) {
+  const source = rawTemplates && typeof rawTemplates === 'object' ? rawTemplates : {};
+  const entries = Object.entries(source);
+  const normalizedEntries = entries
+    .map(([key, value]) => {
+      if (!value || typeof value !== 'object') return null;
+      const preferredName = value.name || key;
+      let safeName;
+      try {
+        safeName = sanitizeSkinName(preferredName);
+      } catch {
+        safeName = sanitizeSkinName(key);
+      }
+      return [safeName, { ...value, name: safeName }];
+    })
+    .filter(Boolean);
+
+  return normalizedEntries.length ? Object.fromEntries(normalizedEntries) : {};
+}
+
 function loadBuiltinSkinsFromHermes() {
   try {
-    if (!fs.existsSync(HERMES_PYTHON) || !fs.existsSync(SKIN_ENGINE_PATH)) return {};
+    if (!HERMES_APP_ROOT || !fs.existsSync(HERMES_PYTHON) || !fs.existsSync(SKIN_ENGINE_PATH)) return {};
     const script = [
       'import json, sys',
       `sys.path.insert(0, ${JSON.stringify(HERMES_APP_ROOT)})`,
@@ -287,16 +338,31 @@ function loadBuiltinSkinsFromHermes() {
       maxBuffer: 10 * 1024 * 1024
     });
     const parsed = JSON.parse(output);
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    return normalizeBuiltinSkinTemplates(parsed);
   } catch (error) {
     console.warn('Failed to load built-in skins from Hermes skin engine:', error.message);
     return {};
   }
 }
 
-function getBuiltinSkinTemplates() {
+function getBuiltinSkinTemplates({ forceRefresh = false } = {}) {
+  const now = Date.now();
+  const cacheFresh = (now - builtinSkinCache.loadedAt) < BUILTIN_SKIN_CACHE_TTL_MS;
+  if (!forceRefresh && cacheFresh) {
+    return { templates: builtinSkinCache.templates, source: builtinSkinCache.source };
+  }
+
   const liveTemplates = loadBuiltinSkinsFromHermes();
-  return Object.keys(liveTemplates).length ? liveTemplates : BUILTIN_SKIN_TEMPLATES;
+  if (Object.keys(liveTemplates).length) {
+    builtinSkinCache.templates = liveTemplates;
+    builtinSkinCache.source = 'hermes-skin-engine';
+  } else {
+    builtinSkinCache.templates = BUILTIN_SKIN_TEMPLATES;
+    builtinSkinCache.source = 'fallback';
+  }
+  builtinSkinCache.loadedAt = now;
+
+  return { templates: builtinSkinCache.templates, source: builtinSkinCache.source };
 }
 
 const COLOR_KEYS = [
@@ -346,9 +412,16 @@ function normalizeAsciiBlock(input) {
 function decodeImagePayload(imageData) {
   const match = String(imageData || '').match(DATA_URL_IMAGE_PATTERN);
   if (!match) throw new Error('Provide a PNG, JPG, GIF, or WEBP image as a data URL');
+
+  const buffer = Buffer.from(match[2], 'base64');
+  if (!buffer.length) throw new Error('Image data is empty');
+  if (buffer.length > MAX_HERO_IMAGE_BYTES) {
+    throw new Error(`Image is too large. Maximum size is ${Math.round(MAX_HERO_IMAGE_BYTES / (1024 * 1024))}MB`);
+  }
+
   return {
     mime: String(match[1] || '').toLowerCase(),
-    buffer: Buffer.from(match[2], 'base64')
+    buffer
   };
 }
 
@@ -686,9 +759,10 @@ async function readYamlFile(filePath) {
 }
 
 function getBuiltinSkins() {
-  return Object.values(getBuiltinSkinTemplates()).map((skin) => ({
-    name: skin.name,
-    description: skin.description,
+  const { templates } = getBuiltinSkinTemplates();
+  return Object.entries(templates).map(([key, skin]) => ({
+    name: skin?.name || key,
+    description: skin?.description || '',
     source: 'builtin'
   }));
 }
@@ -811,7 +885,8 @@ app.get('/api/skins/:name', async (req, res) => {
     const source = req.query.source === 'builtin' ? 'builtin' : 'user';
     const name = sanitizeSkinName(req.params.name);
     if (source === 'builtin') {
-      const skin = getBuiltinSkinTemplates()[name];
+      const { templates } = getBuiltinSkinTemplates();
+      const skin = templates[name];
       if (!skin) return res.status(404).json({ error: 'Built-in skin not found' });
       return res.json({ source, skin: normalizeSkin(skin) });
     }
@@ -874,19 +949,33 @@ app.post('/api/activate/:name', async (req, res) => {
 });
 
 app.get('/api/meta', async (req, res) => {
+  const { source: builtin_skin_source } = getBuiltinSkinTemplates();
+
   let skinEngineFound = false;
+  let hermesPythonFound = false;
   try {
     await fsp.access(SKIN_ENGINE_PATH);
     skinEngineFound = true;
   } catch {
     skinEngineFound = false;
   }
+  try {
+    await fsp.access(HERMES_PYTHON);
+    hermesPythonFound = true;
+  } catch {
+    hermesPythonFound = false;
+  }
+
   res.json({
     hermes_home: HERMES_HOME,
     skins_dir: SKINS_DIR,
     config_path: CONFIG_PATH,
+    hermes_app_root: HERMES_APP_ROOT,
+    hermes_python: HERMES_PYTHON,
+    hermes_python_found: hermesPythonFound,
     skin_engine_path: SKIN_ENGINE_PATH,
-    skin_engine_found: skinEngineFound
+    skin_engine_found: skinEngineFound,
+    builtin_skin_source
   });
 });
 
@@ -947,6 +1036,12 @@ app.post('/api/pick-hero-image', async (req, res) => {
 
     const mime = getImageMimeFromPath(filePath);
     const imageBuffer = await fsp.readFile(filePath);
+    if (!imageBuffer.length) {
+      return res.status(400).json({ error: 'Selected image is empty' });
+    }
+    if (imageBuffer.length > MAX_HERO_IMAGE_BYTES) {
+      return res.status(400).json({ error: `Image is too large. Maximum size is ${Math.round(MAX_HERO_IMAGE_BYTES / (1024 * 1024))}MB` });
+    }
 
     res.json({
       ok: true,

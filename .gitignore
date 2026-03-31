@@ -1,5 +1,6 @@
 app/node_modules/
 app/package-lock.json
+pnpm-lock.yaml
 logs/
 cache/
 .pinokio-temp/

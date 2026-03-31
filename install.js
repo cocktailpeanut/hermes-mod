@@ -5,7 +5,7 @@ module.exports = {
       params: {
         path: "app",
         message: [
-          'npm install'
+          'npm install --no-audit --no-fund'
         ]
       }
     }

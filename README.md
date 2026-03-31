@@ -30,7 +30,15 @@ The app works with the Hermes skin schema, including:
 
 Find it on https://pinokio.co and 1-click install.
 
-### 2. Manual Install
+### 2. Run with npx
+
+```bash
+npx -y hermes-mod
+```
+
+The `-y` flag skips the install prompt and starts the published package immediately.
+
+### 3. Manual Install
 
 Go into `app` and run:
 
